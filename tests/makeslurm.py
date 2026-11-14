@@ -7,6 +7,12 @@
 #   python makeslurm.py t1000.config -g 1x4,2x2           # -> t1000_n4.slurm
 #   python makeslurm.py t1000.config -g 1x4,2x2 --pi      # -> t1000_n4pi.slurm
 #   python makeslurm.py t1000.config -g 1x4,2x2 --phone   # -> t1000_n4phone.slurm
+#   python makeslurm.py t1000.config -g 1x8,2x4 --phone --phone-cores all   # -> t1000_n8phoneall.slurm
+#
+# On the phones (8 cores: 4 slow Cortex-A55 + 2 Cortex-A78 + 2 Cortex-X1):
+#   --phone-cores big  (default) 4 ranks per node, pinned to the 4 big cores (A78 + X1)
+#   --phone-cores all            8 ranks per node, no pinning, includes the slow A55 cores
+#
 #   cd ../runs
 #   sbatch ../tests/t1000_n4.slurm
 #
@@ -23,12 +29,21 @@ parser.add_argument("test", help='JSON config file')
 cluster = parser.add_mutually_exclusive_group()
 cluster.add_argument("--pi", action='store_true', help='generate script for rpi, default is expanse')
 cluster.add_argument("--phone", action='store_true', help='generate script for the phone (Junkyard) cluster, default is expanse')
+parser.add_argument("--phone-cores", choices=["big", "all"], default=None,
+                    help='with --phone: "big" (default) uses 4 ranks per node pinned to the 4 big cores (A78 + X1), "all" uses all 8 cores per node with no pinning')
 parser.add_argument("-g", default=None, help= 'comma separated list of one or more geometries specified as rxc where there are r rows of processors by c columns of processors.  For example -g 4x4,8x2,2x8. If not specified, run the uniprocessor binary.' )
 parser.add_argument("-n", type=int, default=None, help='matrix size')
 parser.add_argument("-i", type=int, default=None, help='number of iterations')
 parser.add_argument("-p", type=int, default=None, help='plot interval')
 parser.add_argument("-k", action="store_true", default=False, help='disable communication')
 args = parser.parse_args()
+
+if args.phone_cores is not None and not args.phone:
+    parser.error("--phone-cores only makes sense together with --phone")
+phone_all = args.phone and args.phone_cores == "all"
+
+# CPU numbers of the big cores on the phones (Tensor G2: cpu0-3 = A55, cpu4-5 = A78, cpu6-7 = X1)
+PHONE_BIG_CPUS = "4-7"
 
 if (args.g == None):
     wavebin = "wave260uni"
@@ -63,7 +78,7 @@ if args.k:
 if args.pi:
     suffix += "pi"
 if args.phone:
-    suffix += "phone"
+    suffix += "phoneall" if phone_all else "phone"
 
 
 testfile = args.test
@@ -78,7 +93,7 @@ testname_with_options = os.path.splitext(testroot)[0] + "_n" + str(np0) + suffix
 cores = np0
 if args.pi or args.phone:
     # every node offers a fixed number of MPI slots; the last node may be partly idle
-    cores_per_node = 3 if args.pi else 4
+    cores_per_node = 3 if args.pi else (8 if phone_all else 4)
     nodes = math.ceil(cores/cores_per_node)
 else:
     nodes = math.ceil(cores/128)
@@ -168,6 +183,7 @@ export OMPI_MCA_oob_tcp_if_include=10.0.0.0/24
 """
 
 user = None
+pin = ""
 if args.pi:
     text = text_pi
     srun = "srun --mpi=pmix"
@@ -175,6 +191,9 @@ if args.pi:
 elif args.phone:
     text = text_phone
     srun = "srun --mpi=pmix"
+    if not phone_all:
+        # restrict every rank to the big cores
+        pin = "taskset -c " + PHONE_BIG_CPUS + " "
     build_dir = "build_phone"
 else:
     user = os.getlogin()
@@ -197,6 +216,6 @@ with open(ofilename, "w") as f:
                         user=user))
     for g in geolist:
         (py, px) = g.split('x')
-        f.write("\n{srun} -n {cores} $SLURM_SUBMIT_DIR/../{build_dir}/{wavebin} $SLURM_SUBMIT_DIR/../tests/{testfile} -y {py} -x {px}{options}\n".format(
-            srun=srun, cores=cores, build_dir=build_dir, wavebin=wavebin,
+        f.write("\n{srun} -n {cores} {pin}$SLURM_SUBMIT_DIR/../{build_dir}/{wavebin} $SLURM_SUBMIT_DIR/../tests/{testfile} -y {py} -x {px}{options}\n".format(
+            srun=srun, cores=cores, pin=pin, build_dir=build_dir, wavebin=wavebin,
             testfile=testfile, py=py, px=px, options=options))
